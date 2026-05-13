@@ -1,0 +1,22 @@
+{
+	"name": "skills",
+	"type": "module",
+	"version": "0.0.1",
+	"description": "Agentic skills for Sifars",
+	"author": "mohiwalla",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/srafis/skills"
+	},
+	"scripts": {
+		"format": "prettier --write ."
+	},
+	"devDependencies": {
+		"@types/bun": "latest",
+		"prettier": "^3.8.3"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
+	}
+}
