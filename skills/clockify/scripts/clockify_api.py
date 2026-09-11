@@ -29,7 +29,7 @@ def parse_bool(value: str):
 
 
 class ClockifyClient:
-    def __init__(self, api_key: str, workspace_id: str, user_id: str):
+    def __init__(self, api_key: str, workspace_id: str, user_id: str | None = None):
         self.api_key = api_key
         self.workspace_id = workspace_id
         self.user_id = user_id
@@ -58,7 +58,7 @@ class ClockifyClient:
             method=method,
         )
         try:
-            with request.urlopen(req) as resp:
+            with request.urlopen(req, timeout=30) as resp:
                 body = resp.read().decode("utf-8")
                 if not body:
                     return {"status": resp.status}
@@ -71,14 +71,46 @@ class ClockifyClient:
                 parsed = {"message": detail}
             raise RuntimeError(f"Clockify API {exc.code}: {json.dumps(parsed)}") from exc
 
-    def list_tags(self, name: str | None = None, page_size: int | None = None):
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                "Clockify transport/response failure. A write may have succeeded; "
+                "read server state before retrying."
+            ) from exc
+
+    def timer_user(self):
+        current_id = self._request("GET", "/user")["id"]
+        if self.user_id and self.user_id != current_id:
+            raise RuntimeError("Timer user differs from API-key owner; refusing to change a timer.")
+        self.user_id = current_id
+        return current_id
+
+    def _list(self, path, query):
+        query = clean_none(query)
+        explicit_page = "page" in query
+        query.setdefault("page", 1)
+        query.setdefault("page-size", 50)
+        if query["page"] < 1 or not 1 <= query["page-size"] <= 1000:
+            raise RuntimeError("page must be positive and page-size must be between 1 and 1000")
+        result = []
+        while True:
+            batch = self._request("GET", path, query=dict(query))
+            if not isinstance(batch, list):
+                raise RuntimeError("Expected a JSON array from Clockify list endpoint")
+            result.extend(batch)
+            if explicit_page or not batch:
+                return result
+            query["page"] += 1
+
+    def list_tags(self, name: str | None = None, page_size: int | None = None,
+                  page: int | None = None):
         query = clean_none(
             {
                 "name": name,
+                "page": page,
                 "page-size": page_size,
             }
         )
-        return self._request("GET", f"/workspaces/{self.workspace_id}/tags", query=query)
+        return self._list(f"/workspaces/{self.workspace_id}/tags", query)
 
     def create_tag(self, name: str):
         return self._request("POST", f"/workspaces/{self.workspace_id}/tags", payload={"name": name})
@@ -93,14 +125,14 @@ class ClockifyClient:
         if not tag_names:
             return resolved or None
 
-        tags = self.list_tags(page_size=500)
-        tags_by_name = {tag["name"]: tag["id"] for tag in tags}
-        for tag_name in tag_names:
-            tag_id = tags_by_name.get(tag_name)
+        for tag_name in dict.fromkeys(tag_names):
+            matches = [t["id"] for t in self.list_tags(name=tag_name) if t["name"] == tag_name]
+            if len(matches) > 1:
+                raise RuntimeError(f"Ambiguous tag name: {tag_name}; use --tag-id")
+            tag_id = matches[0] if matches else None
             if tag_id is None and create_missing:
                 tag = self.create_tag(tag_name)
                 tag_id = tag["id"]
-                tags_by_name[tag_name] = tag_id
             if tag_id is None:
                 raise RuntimeError(
                     f"Clockify tag not found: {tag_name}. Use list-tags or pass --create-missing-tags true."
@@ -117,6 +149,7 @@ class ClockifyClient:
         billable: bool | None = None,
         tag_ids: list[str] | None = None,
     ):
+        self.timer_user()
         payload = clean_none(
             {
                 "start": utc_now_iso(),
@@ -129,6 +162,7 @@ class ClockifyClient:
         return self._request("POST", f"/workspaces/{self.workspace_id}/time-entries", payload=payload)
 
     def stop_timer(self):
+        self.timer_user()
         payload = {"end": utc_now_iso()}
         return self._request(
             "PATCH",
@@ -145,6 +179,8 @@ class ClockifyClient:
         page_size: int | None = None,
         in_progress: bool | None = None,
     ):
+        if not self.user_id:
+            self.user_id = self._request("GET", "/user")["id"]
         query = clean_none(
             {
                 "start": start,
@@ -155,10 +191,8 @@ class ClockifyClient:
                 "in-progress": str(in_progress).lower() if in_progress is not None else None,
             }
         )
-        return self._request(
-            "GET",
-            f"/workspaces/{self.workspace_id}/user/{self.user_id}/time-entries",
-            query=query,
+        return self._list(
+            f"/workspaces/{self.workspace_id}/user/{self.user_id}/time-entries", query
         )
 
     def get_entry(self, entry_id: str):
@@ -167,14 +201,22 @@ class ClockifyClient:
     def update_entry(
         self,
         entry_id: str,
-        start: str,
+        start: str | None = None,
         description: str | None = None,
         end: str | None = None,
         project_id: str | None = None,
         billable: bool | None = None,
         tag_ids: list[str] | None = None,
     ):
-        payload = clean_none(
+        existing = self.get_entry(entry_id)
+        if existing.get("customFieldValues"):
+            raise RuntimeError("Updates with existing custom fields are unsupported; refusing to risk data loss.")
+        interval = existing.get("timeInterval") or {}
+        payload = {k: existing[k] for k in
+                   ("description", "projectId", "taskId", "billable", "tagIds", "type")
+                   if k in existing}
+        payload.update(start=interval.get("start"), end=interval.get("end"))
+        changes = clean_none(
             {
                 "start": start,
                 "description": description,
@@ -184,13 +226,17 @@ class ClockifyClient:
                 "tagIds": tag_ids,
             }
         )
+        payload.update(changes)
+        if not payload.get("start"):
+            raise RuntimeError("Existing entry has no start time; supply --start")
         return self._request("PUT", f"/workspaces/{self.workspace_id}/time-entries/{entry_id}", payload=payload)
 
     def delete_entry(self, entry_id: str):
         return self._request("DELETE", f"/workspaces/{self.workspace_id}/time-entries/{entry_id}")
 
-    def in_progress(self):
-        return self._request("GET", f"/workspaces/{self.workspace_id}/time-entries/status/in-progress")
+    def in_progress(self, page=None, page_size=None):
+        return self._list(f"/workspaces/{self.workspace_id}/time-entries/status/in-progress",
+                          {"page": page, "page-size": page_size})
 
 
 def build_parser():
@@ -233,24 +279,28 @@ def build_parser():
 
     upd = sub.add_parser("update", help="Update a time entry")
     upd.add_argument("--id", required=True)
-    upd.add_argument("--start", required=True, help="UTC timestamp, e.g. 2026-01-02T03:04:05Z")
+    upd.add_argument("--start", help="UTC timestamp, e.g. 2026-01-02T03:04:05Z")
     upd.add_argument("--description")
     upd.add_argument("--end")
     upd.add_argument("--project-id")
     upd.add_argument("--billable", type=parse_bool)
     add_tag_args(upd)
+    upd.add_argument("--clear-tags", action="store_true")
 
     delete_cmd = sub.add_parser("delete", help="Delete a time entry")
     delete_cmd.add_argument("--id", required=True)
 
     list_tags_cmd = sub.add_parser("list-tags", help="List workspace tags")
     list_tags_cmd.add_argument("--name")
+    list_tags_cmd.add_argument("--page", type=int)
     list_tags_cmd.add_argument("--page-size", type=int)
 
     create_tag_cmd = sub.add_parser("create-tag", help="Create a workspace tag")
     create_tag_cmd.add_argument("--name", required=True)
 
-    sub.add_parser("in-progress", help="List in-progress timers on workspace")
+    progress = sub.add_parser("in-progress", help="List in-progress timers on workspace")
+    progress.add_argument("--page", type=int)
+    progress.add_argument("--page-size", type=int)
     return parser
 
 
@@ -263,8 +313,6 @@ def main():
         missing.append("CLOCKIFY_API_KEY/--api-key")
     if not args.workspace_id:
         missing.append("CLOCKIFY_WORKSPACE_ID/--workspace-id")
-    if not args.user_id:
-        missing.append("CLOCKIFY_USER_ID/--user-id")
     if missing:
         print(json.dumps({"error": "Missing required config", "missing": missing}, indent=2))
         return 2
@@ -298,6 +346,8 @@ def main():
     elif args.command == "get":
         out = client.get_entry(args.id)
     elif args.command == "update":
+        if args.clear_tags and (args.tag or args.tag_id):
+            raise RuntimeError("--clear-tags cannot be combined with --tag or --tag-id")
         tag_ids = client.resolve_tag_ids(
             tag_ids=args.tag_id,
             tag_names=args.tag,
@@ -310,16 +360,16 @@ def main():
             end=args.end,
             project_id=args.project_id,
             billable=args.billable,
-            tag_ids=tag_ids,
+            tag_ids=[] if args.clear_tags else tag_ids,
         )
     elif args.command == "delete":
         out = client.delete_entry(args.id)
     elif args.command == "list-tags":
-        out = client.list_tags(name=args.name, page_size=args.page_size)
+        out = client.list_tags(name=args.name, page_size=args.page_size, page=args.page)
     elif args.command == "create-tag":
         out = client.create_tag(name=args.name)
     else:
-        out = client.in_progress()
+        out = client.in_progress(page=args.page, page_size=args.page_size)
 
     print(json.dumps(out, indent=2))
     return 0
