@@ -1,0 +1,4 @@
+interface:
+  display_name: "Quick"
+  short_description: "Delegate a quick fix to a fast subagent"
+  default_prompt: "Use $quick to make this quick fix."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Azure Ticket Drafting"
+  short_description: "Draft implementation-ready Azure work items"
+  default_prompt: "Use $azure-ticket-drafting to draft detailed Azure Boards tickets from the material I provide."
