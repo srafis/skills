@@ -8,5 +8,5 @@ disable-model-invocation: true
 
 Create a codex thread to get the task done
 
-- Use `gpt-5.6-luna` at `xhigh` reasoning
+- Use `gpt-6-luna` at `max` reasoning
 - Inspect the result, finish any necessary integration, and answer briefly.

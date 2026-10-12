@@ -111,7 +111,7 @@ az rest --method PATCH \
 
 Same pair on **parent and children**, with a note that the recording is the **whole story**.
 
-Post comments through the Azure DevOps Comments REST API using the authenticated Azure DevOps client. Preserve paragraph and list spacing, and verify the posted comment before assuming it rendered correctly.
+Post comments through the Azure DevOps Comments REST API using the authenticated Azure DevOps client. Use `<br><br>` between comment paragraphs to leave a blank line; a single `<br>` is only for a line break within a paragraph. Preserve list spacing, and verify the posted comment before assuming it rendered correctly.
 
 ## 8. Commit — only when asked
 

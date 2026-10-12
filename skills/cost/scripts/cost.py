@@ -4,14 +4,20 @@ import os
 from pathlib import Path
 import sys
 
-# USD per million: uncached input, cached input, output. Verified 2026-09-10:
+# USD per million: uncached input, cached input, output.
 # https://developers.openai.com/api/docs/pricing
 RATES = {
     "gpt-6-astra": (10, 1, 50),
+    "gpt-6.1-sol": (2, .1, 10),
     "gpt-5.6-sol": (4, .4, 20),
     "gpt-5.6-terra": (2, .2, 12),
     "gpt-5.6-luna": (.2, .02, 1.2),
 }
+RATE_DATES = {model: "2026-09-10" for model in RATES}
+RATE_DATES["gpt-6.1-sol"] = "2026-10-07"
+# Applied to the full request when its input exceeds the threshold.
+# https://developers.openai.com/api/docs/models/gpt-6.1-sol
+LONG_CONTEXT_RATES = {"gpt-6.1-sol": (272_000, (4, .2, 15))}
 KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
 
 
@@ -60,21 +66,47 @@ def collect(paths, thread, override=None):
                     raise ValueError("I need the model to proceed. Use /cost <model>.")
                 if selected not in RATES:
                     raise ValueError(f"No saved USD rates for {selected}. Supply its input, cached-input and output rates per 1M tokens, or request a rate update.")
-                # ponytail: conservative short-context ceiling; add verified per-model
-                # long-context thresholds and rates when a task exceeds 128K per call.
                 last = info.get("last_token_usage") or {}
-                if last.get("input_tokens", delta[0]) > 128_000:
+                request_input = last.get("input_tokens", delta[0])
+                rates = RATES[selected]
+                policy = LONG_CONTEXT_RATES.get(selected)
+                if policy:
+                    threshold, long_rates = policy
+                    if "input_tokens" not in last and delta[0] > threshold:
+                        raise ValueError("Per-request input telemetry unavailable; cannot select the long-context rate reliably.")
+                    if request_input > threshold:
+                        rates = long_rates
+                elif request_input > 128_000:
                     raise ValueError("This task needs verified long-context rates; request a rate update.")
                 inp, cached, out = delta
                 if not 0 <= cached <= inp:
                     raise ValueError("Invalid cached-input counters; cannot estimate reliably.")
-                rates = RATES[selected]
                 cost += ((inp - cached) * rates[0] + cached * rates[1] + out * rates[2]) / 1_000_000
                 totals = [a + b for a, b in zip(totals, delta)]
                 models.add(selected)
     if not seen:
         raise ValueError("No token telemetry available for the current task.")
     return totals, cost, models
+
+
+def format_report(totals, cost, models):
+    inp, cached, out = totals
+    names = [" ".join(part.upper() if part == "gpt" else part.capitalize()
+                      for part in model.split("-")) for model in sorted(models)]
+    dates = sorted({RATE_DATES[model] for model in models})
+    snapshot = f"{dates[0]} snapshot" if len(dates) == 1 else f"{' / '.join(dates)} snapshots"
+    return "\n".join([
+        "| Metric | Value |",
+        "|---|---:|",
+        f"| Model | {', '.join(names)} |",
+        f"| Total input | {human(inp)} tokens |",
+        f"| Cached input | {human(cached)} tokens |",
+        f"| Uncached input | {human(inp - cached)} tokens |",
+        f"| Output | {human(out)} tokens |",
+        f"| Estimated cost | **${cost:.4f}** |",
+        "",
+        f"Standard API rates, **{snapshot}**. Excludes tool fees and subsequent usage. Not a subscription charge.",
+    ])
 
 
 def main():
@@ -85,11 +117,7 @@ def main():
     root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     paths = list((root / "sessions").glob(f"**/*{thread}*.jsonl"))
     totals, cost, models = collect(paths, thread, override)
-    inp, cached, out = totals
-    print(f"Model: {', '.join(sorted(models))}" + (" (override)" if override else ""))
-    print(f"Input: {human(inp)}\nOutput: {human(out)}\nCached input: {human(cached)}\nUncached input: {human(inp - cached)}")
-    print(f"Estimated USD: ${cost:.4f}")
-    print("Standard API rates, 2026-09-10 snapshot; excludes tool fees and this report's remaining usage. Not a subscription charge.")
+    print(format_report(totals, cost, models))
 
 
 if __name__ == "__main__":
